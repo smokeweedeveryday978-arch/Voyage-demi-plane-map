@@ -1,1 +1,7 @@
-Build the high-resolution seamless master map and Voyage tile set from the current source tiles.
+FINAL rebuild trigger
+Correct mapping: 01 top-left -> 25 bottom-right
+16 = Veiled Fox Sanctuary
+13 = Heartgate Basin
+21 = The Still Frontier
+25 = The Veiled Edge
+Triggered after authoritative mapping fix.
