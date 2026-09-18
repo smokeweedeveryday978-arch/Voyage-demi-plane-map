@@ -1,0 +1,136 @@
+name: Build high-resolution Voyage map
+
+on:
+  push:
+    paths:
+      - BUILD_HIGH_RES
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Pillow
+        run: python -m pip install --upgrade pip pillow
+
+      - name: Assemble one master map from the existing exact tiles
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from PIL import Image
+
+          root = Path(".")
+          work = root / "work_high_res"
+          work.mkdir(exist_ok=True)
+
+          names = {
+              1:"The_Still_Frontier",2:"The_Pale_Reaches",3:"The_North_Field",
+              4:"The_Fold",5:"The_Veiled_Edge",6:"Veiled_Fox_Sanctuary",
+              7:"The_First_Meadow",8:"The_Threshold_March",9:"The_Stone_Rise",
+              10:"The_Mirror_Mere",11:"The_Quiet_Shore",12:"The_Westreach",
+              13:"Heartgate_Basin",14:"The_Dawn_Barrow",15:"The_Easthold",
+              16:"The_Low_Reaches",17:"The_Hollow_Vale",18:"The_Deep_Expanse",
+              19:"The_Southroll",20:"The_Rift_March",21:"The_Dim_March",
+              22:"The_Grey_Boundary",23:"The_Open_Horizon",24:"The_Fade",
+              25:"The_Last_Edge"
+          }
+
+          def p(n):
+              return root / "tiles" / f"{n:02d}_{names[n]}.jpg"
+
+          first = Image.open(p(1)).convert("RGB")
+          tw, th = first.size
+          master = Image.new("RGB", (tw*5, th*5))
+
+          # Required world orientation:
+          # 21 22 23 24 25
+          # 16 17 18 19 20
+          # 11 12 13 14 15
+          # 06 07 08 09 10
+          # 01 02 03 04 05
+          for n in range(1, 26):
+              tile = Image.open(p(n)).convert("RGB")
+              col = (n-1) % 5
+              row_bottom = (n-1) // 5
+              row_top = 4 - row_bottom
+              master.paste(tile, (col*tw, row_top*th))
+
+          out = work / "master_source.png"
+          master.save(out, optimize=True)
+          print("source master:", master.size, "tile:", (tw, th))
+          PY
+
+      - name: Install Real-ESRGAN
+        id: install_realesrgan
+        continue-on-error: true
+        run: |
+          python -m pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cpu
+          git clone --depth 1 https://github.com/xinntao/Real-ESRGAN.git /tmp/Real-ESRGAN
+          cd /tmp/Real-ESRGAN
+          python -m pip install -r requirements.txt
+          python setup.py develop
+          python - <<'PY'
+          from pathlib import Path
+          try:
+              import basicsr
+              p = Path(basicsr.__file__).parent / "data" / "degradations.py"
+              if p.exists():
+                  s = p.read_text()
+                  s = s.replace(
+                      "from torchvision.transforms.functional_tensor import rgb_to_grayscale",
+                      "from torchvision.transforms.functional import rgb_to_grayscale"
+                  )
+                  p.write_text(s)
+                  print("patched", p)
+          except Exception as e:
+              print("patch warning:", e)
+          PY
+          mkdir -p weights
+          wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth -O weights/RealESRGAN_x4plus_anime_6B.pth
+
+      - name: AI super-resolution of the COMPLETE master
+        id: upscale
+        continue-on-error: true
+        if: steps.install_realesrgan.outcome == 'success'
+        run: |
+          mkdir -p work_high_res/realesrgan
+          cd /tmp/Real-ESRGAN
+          python inference_realesrgan.py             -n RealESRGAN_x4plus_anime_6B             -i "$GITHUB_WORKSPACE/work_high_res/master_source.png"             -o "$GITHUB_WORKSPACE/work_high_res/realesrgan"             -s 4             -t 256             --fp32             --ext png
+
+      - name: Export maximum-quality master and exact 5x5 tiles
+        run: python tools/build_high_res.py
+
+      - name: Write build report
+        run: |
+          {
+            echo "# High-resolution build"
+            echo
+            echo "- Source: existing 25 exact map crops, reassembled into ONE master first"
+            echo "- Enhancement result: ${{ steps.upscale.outcome }}"
+            echo "- Seam policy: enhancement applied to the complete master BEFORE slicing"
+            echo "- Grid: 01 bottom-left, 25 top-right"
+            echo "- Voyage set: tiles_v2_voyage (pre-rotated 180 degrees to compensate for observed Voyage rotation)"
+            echo "- Reference set: tiles_v2_upright"
+            echo
+            cat voyage_links_v2.json
+          } > HIGH_RES_BUILD.md
+
+      - name: Commit generated map
+        run: |
+          rm -rf work_high_res
+          git config user.name "ChatGPT Map Builder"
+          git config user.email "actions@users.noreply.github.com"
+          git add master tiles_v2_upright tiles_v2_voyage voyage_links_v2.json HIGH_RES_BUILD.md
+          git commit -m "Build high-resolution seamless Voyage master and tiles" || exit 0
+          git push
